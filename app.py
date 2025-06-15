@@ -56,7 +56,8 @@ __kernel void monte_carlo_gbm(
         double Z = rand_normals[random_offset + step]; // Random shock for this step
         current_price = current_price * exp(drift_term + vol_term * Z);
         // Add a small floor to prevent non-positive prices in simulation
-        results[result_offset + step + 1] = max(current_price, 0.01);
+        // Use fmax for floating point types
+        results[result_offset + step + 1] = fmax(current_price, 0.01);
     }
 }
 """
