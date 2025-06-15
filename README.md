@@ -1,7 +1,5 @@
 # Zillow ZHVI Monte Carlo Simulator
 
-![City skyline](https://images.unsplash.com/photo-1526401281623-3c7b1fd3da93?auto=format&fit=crop&w=1350&q=80)
-
 GPU accelerated Monte Carlo simulations for projecting the **Zillow Home Value Index (ZHVI)** for any U.S. ZIP code. The app downloads ZHVI data, computes historical drift and volatility, and then uses an OpenCL kernel to generate thousands of future price paths. Results are displayed in an interactive browser UI powered by Gradio and Plotly.
 
 ## Features
@@ -9,8 +7,6 @@ GPU accelerated Monte Carlo simulations for projecting the **Zillow Home Value I
 - **Interactive Interface** – Select a ZIP code, history window, and simulation parameters in a Gradio UI.
 - **Real Zillow Data** – Automatically fetches the latest ZHVI dataset.
 - **Plotly Visuals** – View historical trends, simulated paths, and distribution histograms.
-
-![Simulated paths](https://images.unsplash.com/photo-1529419412593-5f9c0e3e7998?auto=format&fit=crop&w=1350&q=80)
 
 ## Installation
 1. Install Python 3.8+ and ensure your system has OpenCL drivers (GPU or CPU).
