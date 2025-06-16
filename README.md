@@ -38,3 +38,10 @@ Try the default ZIP code **07974** (New Providence, NJ) for a quick demo, or ent
 ## License
 This project is released under the MIT License. See [LICENSE](LICENSE) for details.
 
+
+## Additional Example: Music Generator
+This repository also includes a simple Gradio application in `music_app/` that uses PyOpenCL to generate random audio tracks. Run it with:
+```bash
+python music_app/app.py
+```
+It allows generating or deleting up to five FLAC tracks and demonstrates basic OpenCL usage with audio.
