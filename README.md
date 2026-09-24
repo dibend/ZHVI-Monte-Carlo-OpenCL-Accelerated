@@ -32,6 +32,18 @@ Monte Carlo simulations for projecting the **Zillow Home Value Index (ZHVI)** fo
    ```
    The OpenCL kernel is embedded in `app.py`; no separate kernel file is needed. If the optional package or device is unavailable, the regular install still runs on the CPU.
 
+## Debian / ChromeOS Linux virtual environment
+
+From the repository root:
+
+```bash
+bash scripts/setup-opencl-venv.sh
+source .venv/bin/activate
+python app.py
+```
+
+The setup installs a CPU OpenCL runtime (PoCL) and checks every discovered OpenCL device for double precision, which this app's embedded kernel requires. A GPU appears only if ChromeOS passes it through to the Linux VM and a compatible OpenCL driver is installed there. When no suitable OpenCL device is available, the app uses its NumPy CPU path. The system ICD driver is installed through apt; Python dependencies stay in `.venv`. To check devices later, run `clinfo -l` and `python -c 'import pyopencl as cl; print([(p.name, [d.name for d in p.get_devices()]) for p in cl.get_platforms()])'`.
+
 ## Usage
 Run the application with:
 ```bash
