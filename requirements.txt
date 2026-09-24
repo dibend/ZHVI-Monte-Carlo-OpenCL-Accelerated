@@ -2,5 +2,4 @@ gradio
 plotly
 pandas
 numpy
-pyopencl
 soundfile

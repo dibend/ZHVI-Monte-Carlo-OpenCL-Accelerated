@@ -3,8 +3,10 @@ import plotly.graph_objects as go
 import pandas as pd
 import numpy as np
 import time
-import os
-import pyopencl as cl
+try:
+    import pyopencl as cl
+except (ImportError, OSError):
+    cl = None
 
 # --- Constants ---
 # URL for Zillow Home Value Index (ZHVI) Single-Family+Condo monthly data by Zip Code
@@ -17,6 +19,7 @@ DEFAULT_ZIP_CODE = "07974" # New Providence, NJ
 DEFAULT_HIST_PERIOD = "10y" # Period for calculating historical mu/sigma
 DEFAULT_SIM_MONTHS = 120  # Simulate 10 years ahead (12 * 10)
 DEFAULT_NUM_PATHS = 100000 # Default simulation paths
+CPU_RANDOM_TARGET_BYTES = 256 * 1024 * 1024
 
 # --- OpenCL Kernel (Geometric Brownian Motion) ---
 monte_carlo_kernel_code = """
@@ -81,35 +84,34 @@ def get_opencl_context_queue():
         # print("Returning cached OpenCL context/queue.") # Optional debug print
         return get_opencl_context_queue.cache
 
+    if cl is None:
+        raise RuntimeError("PyOpenCL is not installed")
     print("Initializing OpenCL context...")
     try:
-        platform = cl.get_platforms()[0] # Assuming the first platform is desired
-        devices = []
-        try: # Prioritize GPU
-            devices = platform.get_devices(device_type=cl.device_type.GPU)
-            print(f"Found GPU: {devices[0].name}")
-        except cl.RuntimeError: # Error usually means no devices of this type found
-             print("No GPU found.")
-
-        if not devices: # Fallback to CPU
-            try:
-                devices = platform.get_devices(device_type=cl.device_type.CPU)
-                print(f"Using CPU: {devices[0].name}")
-            except cl.RuntimeError:
-                 print("No CPU found either.")
-
-        if not devices:
-            raise RuntimeError("No OpenCL devices found (GPU or CPU). Check drivers/ICD installation.")
-
-        # Create context for the first device found (GPU or CPU)
-        # Note: For specific device selection, set os.environ['PYOPENCL_CTX'] before first call
-        context = cl.Context(devices=[devices[0]])
-        queue = cl.CommandQueue(context)
-        print(f"OpenCL context and queue created successfully for {devices[0].name}.")
-
-        # Cache the result
-        get_opencl_context_queue.cache = (context, queue)
-        return context, queue
+        # Search every platform; the first one may have no usable devices.
+        for device_type in (cl.device_type.GPU, cl.device_type.CPU):
+            for platform in cl.get_platforms():
+                try:
+                    devices = platform.get_devices(device_type=device_type)
+                except cl.Error:
+                    continue
+                for device in devices:
+                    # The embedded kernel uses double precision.
+                    try:
+                        supports_fp64 = device.double_fp_config or "cl_khr_fp64" in device.extensions.split()
+                    except cl.Error:
+                        continue
+                    if not supports_fp64:
+                        continue
+                    try:
+                        context = cl.Context(devices=[device])
+                        queue = cl.CommandQueue(context)
+                    except cl.Error:
+                        continue
+                    print(f"OpenCL device ready: {device.name}")
+                    get_opencl_context_queue.cache = (context, queue)
+                    return context, queue
+        raise RuntimeError("No usable OpenCL device with double precision")
     except cl.Error as e:
         print(f"OpenCL Specific Error during setup: {e}")
         raise RuntimeError(f"Failed to initialize OpenCL context/queue. CL Error Code: {e.code}")
@@ -162,10 +164,10 @@ def run_monte_carlo_simulation_opencl(context, queue, s0, mu, sigma, sim_steps, 
     # --- Compile Kernel (with caching) ---
     try:
         # Use function attribute as a simple program cache to avoid recompiling
-        cache_key = "gbm_kernel"
         if not hasattr(run_monte_carlo_simulation_opencl, "program_cache"):
             run_monte_carlo_simulation_opencl.program_cache = {}
 
+        cache_key = context.devices[0].name
         if cache_key not in run_monte_carlo_simulation_opencl.program_cache:
              print("Compiling OpenCL kernel...")
              program = cl.Program(context, monte_carlo_kernel_code).build()
@@ -217,6 +219,71 @@ def run_monte_carlo_simulation_opencl(context, queue, s0, mu, sigma, sim_steps, 
     # Reshape the flat results array into the desired (num_paths, sim_steps + 1) shape
     sim_paths = results_np.reshape((num_paths, sim_steps + 1))
     return sim_paths
+
+def run_monte_carlo_simulation_cpu(s0, mu, sigma, sim_steps, num_paths):
+    """
+    Runs the same Geometric Brownian Motion Monte Carlo model as the original
+    OpenCL kernel, using NumPy on the CPU only.
+
+    Args:
+        s0 (float): Initial asset value.
+        mu (float): Drift per time step (monthly).
+        sigma (float): Volatility per time step (monthly).
+        sim_steps (int): Number of months to simulate.
+        num_paths (int): Number of simulation paths.
+
+    Returns:
+        numpy.ndarray: Shape (num_paths, sim_steps + 1), including s0 at column 0.
+    """
+    print(f"Preparing CPU simulation: {num_paths} paths, {sim_steps} steps...")
+    start_time = time.time()
+
+    np_dtype = np.float64
+    s0 = np_dtype(s0)
+    mu = np_dtype(mu)
+    sigma = np_dtype(sigma)
+
+    # Same formula as the OpenCL kernel. dt = 1 because mu/sigma are monthly.
+    drift_term = (mu - np_dtype(0.5) * sigma * sigma)
+    vol_term = sigma
+
+    try:
+        sim_paths = np.empty((num_paths, sim_steps + 1), dtype=np_dtype)
+    except (MemoryError, ValueError) as e:
+        required_gib = (num_paths * (sim_steps + 1) * np.dtype(np_dtype).itemsize) / (1024 ** 3)
+        raise RuntimeError(
+            f"Not enough RAM for the requested simulation result array "
+            f"(approximately {required_gib:.2f} GiB required before plotting overhead)."
+        ) from e
+
+    sim_paths[:, 0] = s0
+
+    # Preserve path-major random-number ordering used by the original flattened
+    # OpenCL input while limiting the temporary random array size.
+    bytes_per_path = max(sim_steps, 1) * np.dtype(np_dtype).itemsize
+    chunk_paths = max(1, min(num_paths, CPU_RANDOM_TARGET_BYTES // bytes_per_path))
+
+    for start in range(0, num_paths, chunk_paths):
+        stop = min(start + chunk_paths, num_paths)
+        rows = stop - start
+
+        try:
+            rand_normals = np.random.randn(rows, sim_steps).astype(np_dtype, copy=False)
+            growth_factors = np.exp(drift_term + vol_term * rand_normals)
+            np.cumprod(growth_factors, axis=1, out=growth_factors)
+            growth_factors *= s0
+            np.maximum(growth_factors, np_dtype(0.01), out=growth_factors)
+            sim_paths[start:stop, 1:] = growth_factors
+        except MemoryError as e:
+            raise RuntimeError(
+                "Not enough RAM for the requested CPU simulation. "
+                "Try fewer paths or fewer simulation months."
+            ) from e
+
+    elapsed = time.time() - start_time
+    print(f"CPU simulation finished in {elapsed:.3f} seconds.")
+    return sim_paths
+
 
 # --- Zillow Data Functions ---
 
@@ -476,10 +543,6 @@ def analyze_zillow_simulation(zip_code, hist_period, sim_months, num_paths):
     """
     status = "Processing started..."
     try:
-        # Initialize OpenCL context and queue (uses cache if already done)
-        context, queue = get_opencl_context_queue()
-        status += "\nOpenCL context ready."
-
         # Fetch data and calculate monthly parameters
         hist_series, s0, mu_monthly, sigma_monthly = fetch_and_prepare_zillow_data(zip_code, hist_period)
         status += f"\nData prepared for ZIP {zip_code}. s0=${s0:,.0f}, mu_monthly={mu_monthly:.6f}, sigma_monthly={sigma_monthly:.6f}."
@@ -490,8 +553,20 @@ def analyze_zillow_simulation(zip_code, hist_period, sim_months, num_paths):
         if sim_months <= 0 or num_paths <= 0:
             raise ValueError("Simulation months and number of paths must be positive integers.")
 
-        # Run the simulation on the GPU/CPU via OpenCL
-        sim_paths = run_monte_carlo_simulation_opencl(context, queue, s0, mu_monthly, sigma_monthly, sim_months, num_paths)
+        # OpenCL is optional. Driver, device, kernel, or buffer failures all
+        # fall back to NumPy with a fresh simulation on the CPU.
+        try:
+            context, queue = get_opencl_context_queue()
+            sim_paths = run_monte_carlo_simulation_opencl(
+                context, queue, s0, mu_monthly, sigma_monthly, sim_months, num_paths
+            )
+            status += f"\nBackend: OpenCL ({context.devices[0].name})."
+        except Exception as exc:
+            print(f"OpenCL failed; using NumPy CPU: {exc}")
+            if hasattr(get_opencl_context_queue, "cache"):
+                del get_opencl_context_queue.cache
+            sim_paths = run_monte_carlo_simulation_cpu(s0, mu_monthly, sigma_monthly, sim_months, num_paths)
+            status += f"\nBackend: NumPy CPU (OpenCL failed: {exc})."
         status += f"\nMonte Carlo simulation completed ({num_paths:,} paths, {sim_months} months)."
 
         # Create plots and get final prices
@@ -525,7 +600,7 @@ def analyze_zillow_simulation(zip_code, hist_period, sim_months, num_paths):
         # Return plots and summary text to Gradio outputs
         return fig_hist, fig_sim, fig_hist_final, summary_text
 
-    except (ValueError, RuntimeError, cl.Error, Exception) as e:
+    except Exception as e:
         # Handle errors gracefully and report them in the UI
         error_message = f"An error occurred: {e}"
         print(f"ERROR in analyze_zillow_simulation: {error_message}") # Log to console
@@ -536,10 +611,10 @@ def analyze_zillow_simulation(zip_code, hist_period, sim_months, num_paths):
 
 # --- Gradio Interface Definition ---
 with gr.Blocks(theme=gr.themes.Default(primary_hue="green", secondary_hue="lime"), title="Zillow ZHVI MC Simulator") as demo:
-    gr.Markdown("# GPU-Accelerated Zillow ZHVI Simulation (Monte Carlo + PyOpenCL)")
+    gr.Markdown("# Zillow ZHVI Simulation (Monte Carlo + optional PyOpenCL)")
     gr.Markdown(
         "Select a US ZIP code and historical period to calculate parameters. Then, simulate potential future "
-        "monthly Zillow Home Value Index (ZHVI) paths using OpenCL on your GPU/CPU."
+        "monthly Zillow Home Value Index (ZHVI) paths using OpenCL when supported, or NumPy on the CPU."
         "\n*Data Source: Zillow Research - [ZHVI Data](https://www.zillow.com/research/data/)*"
     )
 
