@@ -3,6 +3,8 @@ import plotly.graph_objects as go
 import pandas as pd
 import numpy as np
 import time
+from functools import lru_cache
+
 try:
     import pyopencl as cl
 except (ImportError, OSError):
@@ -20,205 +22,285 @@ DEFAULT_HIST_PERIOD = "10y" # Period for calculating historical mu/sigma
 DEFAULT_SIM_MONTHS = 120  # Simulate 10 years ahead (12 * 10)
 DEFAULT_NUM_PATHS = 100000 # Default simulation paths
 CPU_RANDOM_TARGET_BYTES = 256 * 1024 * 1024
+OPENCL_BATCH_TARGET_BYTES = 256 * 1024 * 1024
 
 # --- OpenCL Kernel (Geometric Brownian Motion) ---
 monte_carlo_kernel_code = """
-#pragma OPENCL EXTENSION cl_khr_fp64 : enable // Enable double precision if supported
+#ifdef USE_DOUBLE
+#if defined(cl_khr_fp64)
+#pragma OPENCL EXTENSION cl_khr_fp64 : enable
+#elif defined(cl_amd_fp64)
+#pragma OPENCL EXTENSION cl_amd_fp64 : enable
+#endif
+typedef double real_t;
+#else
+typedef float real_t;
+#endif
 
 __kernel void monte_carlo_gbm(
-    __global const double* rand_normals, // Input: Pre-generated standard normal random numbers
-    __global double* results,          // Output: Simulated price paths (flattened array)
-    const double s0,                   // Input: Initial stock price
-    const double mu,                   // Input: Drift per step (monthly)
-    const double sigma,                // Input: Volatility per step (monthly)
+    __global const real_t* rand_normals, // Input: Pre-generated standard normal random numbers
+    __global real_t* results,          // Output: Simulated price paths (flattened array)
+    const real_t s0,                   // Input: Initial stock price
+    const real_t mu,                   // Input: Drift per step (monthly)
+    const real_t sigma,                // Input: Volatility per step (monthly)
     const unsigned int num_steps,      // Input: Number of simulation steps (months)
     const unsigned int num_paths       // Input: Total number of simulation paths (global size)
 ) {
     // Get the unique ID for this path (work-item)
-    unsigned int path_id = get_global_id(0);
+    size_t path_id = get_global_id(0);
 
     // Boundary check
     if (path_id >= num_paths) {
         return;
     }
 
-    double current_price = s0;
+    real_t current_price = s0;
     // dt is 1 since mu and sigma are already per-step (monthly)
-    double dt = 1.0;
-    double drift_term = (mu - 0.5 * sigma * sigma) * dt;
-    double vol_term = sigma * sqrt(dt);
+    real_t drift_term = mu - (real_t)0.5 * sigma * sigma;
+    real_t vol_term = sigma;
 
     // Calculate start indices for this path in the flat arrays
-    unsigned int random_offset = path_id * num_steps;
-    unsigned int result_offset = path_id * (num_steps + 1); // +1 for s0
+    size_t random_offset = path_id * num_steps;
+    size_t result_offset = path_id * (num_steps + 1); // +1 for s0
 
     results[result_offset] = s0; // Store initial price
 
     // Simulate path
     for (unsigned int step = 0; step < num_steps; ++step) {
-        double Z = rand_normals[random_offset + step]; // Random shock for this step
+        real_t Z = rand_normals[random_offset + step]; // Random shock for this step
         current_price = current_price * exp(drift_term + vol_term * Z);
         // Add a small floor to prevent non-positive prices in simulation
         // Use fmax for floating point types
-        results[result_offset + step + 1] = fmax(current_price, 0.01);
+        results[result_offset + step + 1] = fmax(current_price, (real_t)0.01);
     }
 }
 """
 
 # --- Helper Functions ---
 
-def get_opencl_context_queue():
-    """
-    Initializes and returns a PyOpenCL context and command queue.
-    Attempts to use GPU first, falls back to CPU if no GPU is found.
-    Caches the context and queue for efficiency within the session.
-
-    Returns:
-        tuple: (pyopencl.Context, pyopencl.CommandQueue)
-
-    Raises:
-        RuntimeError: If no suitable OpenCL devices are found or initialization fails.
-    """
-    # Use a function attribute as a simple cache
-    if hasattr(get_opencl_context_queue, "cache"):
-        # print("Returning cached OpenCL context/queue.") # Optional debug print
-        return get_opencl_context_queue.cache
-
-    if cl is None:
-        raise RuntimeError("PyOpenCL is not installed")
-    print("Initializing OpenCL context...")
+def device_supports_fp64(device):
+    """Some drivers expose FP64 through a capability, others through an extension."""
     try:
-        # Search every platform; the first one may have no usable devices.
-        for device_type in (cl.device_type.GPU, cl.device_type.CPU):
-            for platform in cl.get_platforms():
-                try:
-                    devices = platform.get_devices(device_type=device_type)
-                except cl.Error:
+        if device.double_fp_config:
+            return True
+    except cl.Error:
+        pass
+    return bool({"cl_khr_fp64", "cl_amd_fp64"} & set(device.extensions.split()))
+
+
+def discover_opencl_devices():
+    """Enumerate all platforms without allowing a broken driver to hide others."""
+    if cl is None:
+        return [], ["PyOpenCL is not installed or could not be loaded."]
+    try:
+        platforms = cl.get_platforms()
+    except Exception as exc:
+        return [], [f"OpenCL discovery failed: {exc}"]
+
+    devices, issues = [], []
+    for platform_index, platform in enumerate(platforms):
+        try:
+            platform_name = platform.name.strip()
+            platform_key = str(platform.int_ptr)
+            platform_devices = platform.get_devices()
+        except Exception as exc:
+            issues.append(f"Platform {platform_index + 1} could not be read: {exc}")
+            continue
+        for device_index, device in enumerate(platform_devices):
+            try:
+                name = device.name.strip()
+                if not device.available or not device.compiler_available:
+                    issues.append(f"{platform_name} / {name} is unavailable or has no OpenCL compiler.")
                     continue
-                for device in devices:
-                    # The embedded kernel uses double precision.
-                    try:
-                        supports_fp64 = device.double_fp_config or "cl_khr_fp64" in device.extensions.split()
-                    except cl.Error:
-                        continue
-                    if not supports_fp64:
-                        continue
-                    try:
-                        context = cl.Context(devices=[device])
-                        queue = cl.CommandQueue(context)
-                    except cl.Error:
-                        continue
-                    print(f"OpenCL device ready: {device.name}")
-                    get_opencl_context_queue.cache = (context, queue)
-                    return context, queue
-        raise RuntimeError("No usable OpenCL device with double precision")
-    except cl.Error as e:
-        print(f"OpenCL Specific Error during setup: {e}")
-        raise RuntimeError(f"Failed to initialize OpenCL context/queue. CL Error Code: {e.code}")
-    except Exception as e:
-        print(f"Generic Error during OpenCL setup: {e}")
-        raise RuntimeError(f"Failed to initialize OpenCL: {e}")
+                kind = (
+                    "GPU" if device.type & cl.device_type.GPU else
+                    "CPU" if device.type & cl.device_type.CPU else "Accelerator"
+                )
+                precision = "float64" if device_supports_fp64(device) else "float32"
+                devices.append({
+                    # Driver handles distinguish identically named physical devices.
+                    "key": f"{platform_key}:{device.int_ptr}",
+                    "platform_key": platform_key,
+                    "platform_label": f"{platform_index + 1}: {platform_name}",
+                    "name": name,
+                    "label": f"{platform_name} / {device_index + 1}: {name} ({kind}, {precision})",
+                    "kind": kind,
+                    "precision": precision,
+                    "device": device,
+                })
+            except Exception as exc:
+                issues.append(f"{platform_name} device {device_index + 1} could not be read: {exc}")
+    if not devices and not issues:
+        issues.append("No OpenCL devices were found.")
+    return devices, issues
 
-def run_monte_carlo_simulation_opencl(context, queue, s0, mu, sigma, sim_steps, num_paths):
-    """
-    Runs the Monte Carlo simulation using the pre-compiled OpenCL kernel.
 
-    Args:
-        context (pyopencl.Context): The OpenCL context.
-        queue (pyopencl.CommandQueue): The OpenCL command queue.
-        s0 (float): Initial asset value.
-        mu (float): Drift per time step (e.g., monthly).
-        sigma (float): Volatility per time step (e.g., monthly).
-        sim_steps (int): Number of steps (e.g., months) to simulate.
-        num_paths (int): Number of simulation paths to run in parallel.
+@lru_cache(maxsize=8)
+def _get_opencl_context(device):
+    return cl.Context(devices=[device])
 
-    Returns:
-        numpy.ndarray: A 2D array of shape (num_paths, sim_steps + 1) containing
-                       the simulated value paths, including the initial value s0.
 
-    Raises:
-        RuntimeError: If OpenCL buffer creation, kernel compilation/execution,
-                      or result copying fails.
-    """
-    print(f"Preparing OpenCL simulation: {num_paths} paths, {sim_steps} steps...")
+def get_opencl_context_queue(device):
+    """Cache contexts per physical device, but give each simulation its own queue."""
+    context = _get_opencl_context(device)
+    return context, cl.CommandQueue(context, device=device)
+
+
+@lru_cache(maxsize=8)
+def _get_opencl_program(context, precision):
+    # Programs belong to a context, not a device name. Two GPUs may share a name.
+    options = ["-DUSE_DOUBLE=1"] if precision == "float64" else []
+    return cl.Program(context, monte_carlo_kernel_code).build(options=options)
+
+
+def clear_opencl_caches():
+    _get_opencl_program.cache_clear()
+    _get_opencl_context.cache_clear()
+
+
+def opencl_batch_paths(device, sim_steps, num_paths, itemsize):
+    """Respect both per-buffer and total device-memory limits."""
+    random_bytes = sim_steps * itemsize
+    result_bytes = (sim_steps + 1) * itemsize
+    budget = min(OPENCL_BATCH_TARGET_BYTES, int(device.global_mem_size) // 4)
+    max_allocation = int(device.max_mem_alloc_size)
+    rows = min(
+        num_paths,
+        budget // (random_bytes + result_bytes),
+        max_allocation // random_bytes,
+        max_allocation // result_bytes,
+    )
+    if rows < 1:
+        raise RuntimeError("The selected OpenCL device has too little memory for one path.")
+    return rows
+
+
+def run_monte_carlo_simulation_opencl(context, queue, s0, mu, sigma, sim_steps,
+                                      num_paths, precision=None):
+    """Run the embedded GBM kernel in bounded batches on the selected device."""
+    if precision is None:
+        precision = "float64" if device_supports_fp64(queue.device) else "float32"
+    if precision not in ("float32", "float64"):
+        raise ValueError("OpenCL precision must be float32 or float64.")
+    np_dtype = np.dtype(precision).type
+    print(f"Preparing OpenCL simulation: {num_paths} paths, {sim_steps} steps ({precision})...")
     start_time = time.time()
 
-    np_dtype = np.float64 # Use double precision
+    program = _get_opencl_program(context, precision)
+    # Kernel argument state must not be shared between concurrent requests.
+    kernel = cl.Kernel(program, "monte_carlo_gbm")
+    kernel.set_scalar_arg_dtypes([None, None, np_dtype, np_dtype, np_dtype, np.uint32, np.uint32])
+    batch_paths = opencl_batch_paths(queue.device, sim_steps, num_paths, np.dtype(np_dtype).itemsize)
+    results = np.empty((num_paths, sim_steps + 1), dtype=np_dtype)
 
-    # --- Prepare Host Data ---
-    total_random_numbers = num_paths * sim_steps
-    # Generate random numbers on CPU; for very large sims, consider GPU random number generation (e.g., pyopencl.clrandom)
-    rand_normals_np = np.random.randn(total_random_numbers).astype(np_dtype)
-    results_np = np.empty(num_paths * (sim_steps + 1), dtype=np_dtype) # For s0 + steps
-
-    # --- Create OpenCL Buffers ---
-    mf = cl.mem_flags
+    random_buffer = result_buffer = None
     try:
-        # Input buffer for random numbers, copy from host
-        rand_normals_buf = cl.Buffer(context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=rand_normals_np)
-        # Output buffer for results, allocated on device
-        results_buf = cl.Buffer(context, mf.WRITE_ONLY, results_np.nbytes)
-    except cl.Error as e:
-        raise RuntimeError(f"Failed to create OpenCL buffers. CL Error Code: {e.code}")
+        random_buffer = cl.Buffer(
+            context, cl.mem_flags.READ_ONLY,
+            batch_paths * sim_steps * np.dtype(np_dtype).itemsize,
+        )
+        result_buffer = cl.Buffer(
+            context, cl.mem_flags.WRITE_ONLY,
+            batch_paths * (sim_steps + 1) * np.dtype(np_dtype).itemsize,
+        )
+        for start in range(0, num_paths, batch_paths):
+            stop = min(start + batch_paths, num_paths)
+            rows = stop - start
+            # Path-major ordering matches the NumPy implementation.
+            normals = np.random.randn(rows, sim_steps).astype(np_dtype, copy=False)
+            cl.enqueue_copy(queue, random_buffer, normals, is_blocking=True)
+            kernel(
+                queue, (rows,), None, random_buffer, result_buffer,
+                np_dtype(s0), np_dtype(mu), np_dtype(sigma),
+                np.uint32(sim_steps), np.uint32(rows),
+            )
+            cl.enqueue_copy(queue, results[start:stop], result_buffer, is_blocking=True)
+            if not np.isfinite(results[start:stop]).all():
+                raise RuntimeError("OpenCL produced non-finite values; retrying on CPU.")
+    finally:
+        # Release device buffers even on allocation/execution/copy errors.
+        for buffer in (random_buffer, result_buffer):
+            if buffer is not None:
+                buffer.release()
 
-    # --- Compile Kernel (with caching) ---
-    try:
-        # Use function attribute as a simple program cache to avoid recompiling
-        if not hasattr(run_monte_carlo_simulation_opencl, "program_cache"):
-            run_monte_carlo_simulation_opencl.program_cache = {}
+    print(f"OpenCL simulation finished in {time.time() - start_time:.3f} seconds.")
+    return results
 
-        cache_key = context.devices[0].name
-        if cache_key not in run_monte_carlo_simulation_opencl.program_cache:
-             print("Compiling OpenCL kernel...")
-             program = cl.Program(context, monte_carlo_kernel_code).build()
-             run_monte_carlo_simulation_opencl.program_cache[cache_key] = program
-             print("Kernel compiled and cached.")
-        else:
-             # print("Using cached OpenCL kernel.") # Optional debug print
-             program = run_monte_carlo_simulation_opencl.program_cache[cache_key]
 
-        kernel = program.monte_carlo_gbm
-        # Explicitly set scalar arg types for clarity and potentially avoiding issues
-        kernel.set_scalar_arg_dtypes([None, None, np_dtype, np_dtype, np_dtype, np.uint32, np.uint32])
+def run_simulation(s0, mu, sigma, sim_steps, num_paths, backend="auto",
+                   platform_key="auto", device_key="auto"):
+    """Honor explicit selections, try all automatic candidates, then fall back."""
+    if sim_steps <= 0 or num_paths <= 0:
+        raise ValueError("Simulation months and number of paths must be positive integers.")
+    if backend == "cpu":
+        return (
+            run_monte_carlo_simulation_cpu(s0, mu, sigma, sim_steps, num_paths),
+            "Backend: NumPy CPU (selected manually).",
+        )
+    if backend != "auto":
+        raise ValueError("Unknown compute backend.")
 
-    except cl.Error as e:
-        build_log = "Build log not readily available."
-        # Attempt to get build log for debugging
+    devices, issues = discover_opencl_devices()
+    candidates = [
+        item for item in devices
+        if platform_key in (None, "auto", item["platform_key"])
+        and device_key in (None, "auto", item["key"])
+    ]
+    if not candidates and (platform_key not in (None, "auto") or device_key not in (None, "auto")):
+        issues.insert(0, "The selected OpenCL platform/device is no longer available. Refresh devices.")
+    candidates.sort(key=lambda item: {"GPU": 0, "CPU": 1}.get(item["kind"], 2))
+    for item in candidates:
         try:
-            # Assuming context.devices[0] is the device it tried to build for
-            build_log = program.get_build_info(context.devices[0], cl.program_build_info.LOG)
-        except Exception as log_e:
-             build_log = f"Could not retrieve build log: {log_e}"
-        raise RuntimeError(f"Failed to build OpenCL kernel. CL Error Code: {e.code}\nBuild Log:\n{build_log}")
+            context, queue = get_opencl_context_queue(item["device"])
+            paths = run_monte_carlo_simulation_opencl(
+                context, queue, s0, mu, sigma, sim_steps, num_paths, item["precision"],
+            )
+            return paths, f"Backend: PyOpenCL — {item['label']}."
+        except Exception as exc:
+            print(f"OpenCL failed on {item['label']}: {exc}")
+            issues.append(f"{item['name']}: {str(exc).splitlines()[0] if str(exc) else type(exc).__name__}")
+            clear_opencl_caches()
 
-    # --- Execute Kernel ---
-    global_size = (num_paths,) # Total number of work-items (one per path)
-    local_size = None # Let the OpenCL implementation determine the work-group size
+    reason = "; ".join(issues) or "No usable OpenCL device."
+    # Run the CPU fallback outside the OpenCL exception handler so failed buffers
+    # and host arrays are not kept alive by its traceback.
+    return (
+        run_monte_carlo_simulation_cpu(s0, mu, sigma, sim_steps, num_paths),
+        f"Backend: NumPy CPU (OpenCL fallback: {reason}).",
+    )
 
-    print(f"Executing kernel with global_size={global_size}...")
-    try:
-        # Pass arguments: queue, global work size, local work size, kernel args...
-        kernel_event = kernel(queue, global_size, local_size,
-                              rand_normals_buf, results_buf,
-                              np_dtype(s0), np_dtype(mu), np_dtype(sigma),
-                              np.uint32(sim_steps), np.uint32(num_paths))
-        kernel_event.wait() # Ensure kernel finishes before proceeding
-    except cl.Error as e:
-         raise RuntimeError(f"Failed kernel execution. CL Error Code: {e.code}")
 
-    # --- Retrieve Results ---
-    try:
-        # Copy data from the device results buffer back to the host numpy array
-        cl.enqueue_copy(queue, results_np, results_buf).wait()
-    except cl.Error as e:
-         raise RuntimeError(f"Failed to copy results from device. CL Error Code: {e.code}")
-
-    end_time = time.time()
-    print(f"OpenCL simulation finished in {end_time - start_time:.3f} seconds.")
-
-    # Reshape the flat results array into the desired (num_paths, sim_steps + 1) shape
-    sim_paths = results_np.reshape((num_paths, sim_steps + 1))
-    return sim_paths
+def update_compute_controls(backend="auto", platform_key="auto", device_key="auto"):
+    """Refresh dropdown choices, retaining selections only while they are valid."""
+    devices, issues = discover_opencl_devices()
+    platforms = list(dict.fromkeys(
+        (item["platform_label"], item["platform_key"]) for item in devices
+    ))
+    platform_choices = [("All OpenCL platforms", "auto")] + platforms
+    messages = []
+    if platform_key not in {value for _, value in platform_choices}:
+        platform_key, device_key = "auto", "auto"
+        messages.append("Previous platform unavailable; selection reset to automatic.")
+    filtered = [item for item in devices if platform_key in ("auto", item["platform_key"])]
+    device_choices = [("Automatic (GPU first)", "auto")] + [
+        (item["label"], item["key"]) for item in filtered
+    ]
+    if device_key not in {value for _, value in device_choices}:
+        device_key = "auto"
+        messages.append("Device selection reset to automatic for this platform.")
+    enabled = backend != "cpu" and bool(devices)
+    if backend == "cpu":
+        messages.append("NumPy CPU selected. OpenCL will not be used for simulations.")
+    elif devices:
+        messages.append(f"Found {len(devices)} OpenCL device(s). NumPy CPU fallback is always available.")
+    else:
+        messages.append("No usable OpenCL device. Simulations will run on NumPy CPU.")
+    messages.extend(issues)
+    return (
+        gr.Dropdown(choices=platform_choices, value=platform_key, interactive=enabled),
+        gr.Dropdown(choices=device_choices, value=device_key, interactive=enabled and bool(filtered)),
+        "\n".join(messages),
+    )
 
 def run_monte_carlo_simulation_cpu(s0, mu, sigma, sim_steps, num_paths):
     """
@@ -468,7 +550,8 @@ def create_zillow_plots(hist_series, sim_paths, zip_code, sim_months):
         fig_sim.add_trace(go.Scatter(x=sim_dates_plotting, y=sim_paths[i, :], mode='lines',
                                      line=dict(width=0.5), showlegend=False, opacity=0.1))
     # Plot the mean path
-    mean_path = sim_paths.mean(axis=0)
+    # Accumulate in float64 even when a device returns float32 paths.
+    mean_path = sim_paths.mean(axis=0, dtype=np.float64)
     fig_sim.add_trace(go.Scatter(x=sim_dates_plotting, y=mean_path, mode='lines', name='Mean Path',
                                  line=dict(color='red', width=2)))
 
@@ -488,7 +571,7 @@ def create_zillow_plots(hist_series, sim_paths, zip_code, sim_months):
     p5 = np.percentile(final_prices, 5)
     p50 = np.percentile(final_prices, 50) # Median
     p95 = np.percentile(final_prices, 95)
-    mean_final = final_prices.mean()
+    mean_final = final_prices.mean(dtype=np.float64)
 
     # Add vertical lines with rotated annotations AND vertical shift
     fig_hist_final.add_vline(x=p5, line_dash="dash", line_color="yellow",
@@ -526,7 +609,8 @@ def create_zillow_plots(hist_series, sim_paths, zip_code, sim_months):
 
 
 # --- Main Gradio Function ---
-def analyze_zillow_simulation(zip_code, hist_period, sim_months, num_paths):
+def analyze_zillow_simulation(zip_code, hist_period, sim_months, num_paths,
+                              backend="auto", platform_key="auto", device_key="auto"):
     """
     Orchestrates the Zillow data fetching, parameter calculation, OpenCL simulation,
     plotting, and statistics generation for the Gradio interface.
@@ -536,6 +620,9 @@ def analyze_zillow_simulation(zip_code, hist_period, sim_months, num_paths):
         hist_period (str): Historical period for calculations (e.g., "10y").
         sim_months (int): Number of months to simulate.
         num_paths (int): Number of simulation paths.
+        backend (str): Use OpenCL when available (auto), or force NumPy (cpu).
+        platform_key (str): Selected OpenCL platform, or auto for all platforms.
+        device_key (str): Selected device, or auto to prefer GPUs.
 
     Returns:
         tuple: Contains Plotly figures (hist, sim, dist) and a summary text string.
@@ -553,20 +640,11 @@ def analyze_zillow_simulation(zip_code, hist_period, sim_months, num_paths):
         if sim_months <= 0 or num_paths <= 0:
             raise ValueError("Simulation months and number of paths must be positive integers.")
 
-        # OpenCL is optional. Driver, device, kernel, or buffer failures all
-        # fall back to NumPy with a fresh simulation on the CPU.
-        try:
-            context, queue = get_opencl_context_queue()
-            sim_paths = run_monte_carlo_simulation_opencl(
-                context, queue, s0, mu_monthly, sigma_monthly, sim_months, num_paths
-            )
-            status += f"\nBackend: OpenCL ({context.devices[0].name})."
-        except Exception as exc:
-            print(f"OpenCL failed; using NumPy CPU: {exc}")
-            if hasattr(get_opencl_context_queue, "cache"):
-                del get_opencl_context_queue.cache
-            sim_paths = run_monte_carlo_simulation_cpu(s0, mu_monthly, sigma_monthly, sim_months, num_paths)
-            status += f"\nBackend: NumPy CPU (OpenCL failed: {exc})."
+        sim_paths, backend_status = run_simulation(
+            s0, mu_monthly, sigma_monthly, sim_months, num_paths,
+            backend, platform_key, device_key,
+        )
+        status += f"\n{backend_status}"
         status += f"\nMonte Carlo simulation completed ({num_paths:,} paths, {sim_months} months)."
 
         # Create plots and get final prices
@@ -574,9 +652,9 @@ def analyze_zillow_simulation(zip_code, hist_period, sim_months, num_paths):
         status += "\nPlots generated."
 
         # Calculate summary statistics from simulation results
-        mean_final = final_prices.mean()
+        mean_final = final_prices.mean(dtype=np.float64)
         median_final = np.median(final_prices)
-        std_final = final_prices.std()
+        std_final = final_prices.std(dtype=np.float64)
         p5 = np.percentile(final_prices, 5)
         p95 = np.percentile(final_prices, 95)
 
@@ -610,7 +688,7 @@ def analyze_zillow_simulation(zip_code, hist_period, sim_months, num_paths):
 
 
 # --- Gradio Interface Definition ---
-with gr.Blocks(theme=gr.themes.Default(primary_hue="green", secondary_hue="lime"), title="Zillow ZHVI MC Simulator") as demo:
+with gr.Blocks(title="Zillow ZHVI MC Simulator") as demo:
     gr.Markdown("# Zillow ZHVI Simulation (Monte Carlo + optional PyOpenCL)")
     gr.Markdown(
         "Select a US ZIP code and historical period to calculate parameters. Then, simulate potential future "
@@ -625,6 +703,24 @@ with gr.Blocks(theme=gr.themes.Default(primary_hue="green", secondary_hue="lime"
             sim_months_input = gr.Slider(label="Simulation Months Ahead", minimum=12, maximum=240, value=DEFAULT_SIM_MONTHS, step=12) # Range: 1 to 20 years
             # Adjusted slider for number of paths (traces) - no log scale label
             num_paths_input = gr.Slider(label="Number of Simulation Paths (Traces)", minimum=10000, maximum=10000000, value=DEFAULT_NUM_PATHS, step=10000)
+            backend_input = gr.Dropdown(
+                label="Compute backend",
+                choices=[("OpenCL if available (CPU fallback)", "auto"), ("CPU (NumPy)", "cpu")],
+                value="auto", interactive=True,
+            )
+            platform_input = gr.Dropdown(
+                label="OpenCL platform", choices=[("All OpenCL platforms", "auto")],
+                value="auto", interactive=False,
+            )
+            device_input = gr.Dropdown(
+                label="OpenCL device", choices=[("Automatic (GPU first)", "auto")],
+                value="auto", interactive=False,
+            )
+            refresh_devices_button = gr.Button("Refresh devices")
+            device_status = gr.Textbox(
+                label="Device availability", value="Checking OpenCL devices...",
+                lines=3, interactive=False,
+            )
             run_button = gr.Button("Run Simulation", variant="primary")
 
         with gr.Column(scale=3):
@@ -642,9 +738,18 @@ with gr.Blocks(theme=gr.themes.Default(primary_hue="green", secondary_hue="lime"
     # Connect the button click to the main analysis function and specify inputs/outputs
     run_button.click(
         analyze_zillow_simulation,
-        inputs=[zip_input, hist_period_input, sim_months_input, num_paths_input],
+        inputs=[zip_input, hist_period_input, sim_months_input, num_paths_input,
+                backend_input, platform_input, device_input],
         outputs=[plot_output_hist, plot_output_sim, plot_output_dist, summary_output]
     )
+
+    compute_inputs = [backend_input, platform_input, device_input]
+    compute_outputs = [platform_input, device_input, device_status]
+    demo.load(update_compute_controls, inputs=compute_inputs, outputs=compute_outputs)
+    # input fires only for user edits, avoiding recursive events from dropdown updates.
+    backend_input.input(update_compute_controls, inputs=compute_inputs, outputs=compute_outputs)
+    platform_input.input(update_compute_controls, inputs=compute_inputs, outputs=compute_outputs)
+    refresh_devices_button.click(update_compute_controls, inputs=compute_inputs, outputs=compute_outputs)
 
     # Provide examples for users to easily try (Corrected List)
     gr.Examples(
@@ -666,4 +771,7 @@ with gr.Blocks(theme=gr.themes.Default(primary_hue="green", secondary_hue="lime"
 # --- Launch App ---
 if __name__ == "__main__":
     # Launch Gradio app. share=False keeps it local. debug=True shows errors in browser.
-    demo.launch(share=True, debug=True)
+    demo.launch(
+        share=True, debug=True,
+        theme=gr.themes.Default(primary_hue="green", secondary_hue="lime"),
+    )
