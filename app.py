@@ -1,3 +1,5 @@
+import os
+
 import gradio as gr
 import plotly.graph_objects as go
 import pandas as pd
@@ -751,9 +753,12 @@ with gr.Blocks(title="Zillow ZHVI MC Simulator") as demo:
     platform_input.input(update_compute_controls, inputs=compute_inputs, outputs=compute_outputs)
     refresh_devices_button.click(update_compute_controls, inputs=compute_inputs, outputs=compute_outputs)
 
-    # Provide examples for users to easily try (Corrected List)
-    gr.Examples(
-        examples=[
+    # These presets only fill inputs. gr.Examples also creates a CSV cache
+    # logger with a multiprocessing semaphore, even when caching is unused.
+    example_inputs = [zip_input, hist_period_input, sim_months_input, num_paths_input]
+    example_dataset = gr.Dataset(
+        label="Examples", components=example_inputs, type="values",
+        samples=[
             # Corrected examples for 80132 and 07074
             ["80132", "max", 120, 250000],  # Monument, CO; max history; 10yr sim; 250k paths
             ["07074", "10y", 60, 150000],   # Paramus, NJ; 10y history; 5yr sim; 150k paths
@@ -763,15 +768,36 @@ with gr.Blocks(title="Zillow ZHVI MC Simulator") as demo:
             ["80132", "max", 180, 500000],  # Monument, CO; max history; 15yr sim; 500k paths (different params)
             ["33139", "5y", 36, 100000],   # Miami Beach; 5y history; 3yr sim; 100k paths
         ],
-        # Ensure inputs match the function signature for examples
-        inputs=[zip_input, hist_period_input, sim_months_input, num_paths_input]
+    )
+    example_dataset.click(
+        fn=lambda values: values,
+        inputs=[example_dataset], outputs=example_inputs, queue=False,
     )
 
 
 # --- Launch App ---
-if __name__ == "__main__":
-    # Launch Gradio app. share=False keeps it local. debug=True shows errors in browser.
+def get_gradio_auth():
+    """Enable login when credentials are supplied, rejecting incomplete settings."""
+    username = os.environ.get("GRADIO_USERNAME")
+    password = os.environ.get("GRADIO_PASSWORD")
+    if username is None and password is None:
+        return None
+    if not username or not password:
+        raise ValueError(
+            "Set both GRADIO_USERNAME and GRADIO_PASSWORD to non-empty values, "
+            "or unset both to run without authentication."
+        )
+    return username, password
+
+
+def launch_app():
+    # Validate credentials before starting the server or public share tunnel.
+    auth = get_gradio_auth()
     demo.launch(
-        share=True, debug=True,
+        share=True, debug=True, auth=auth,
         theme=gr.themes.Default(primary_hue="green", secondary_hue="lime"),
     )
+
+
+if __name__ == "__main__":
+    launch_app()
