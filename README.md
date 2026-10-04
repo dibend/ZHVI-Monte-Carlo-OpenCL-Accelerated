@@ -48,6 +48,38 @@ This launches a Gradio interface where you can choose a ZIP code and simulation 
 
 Devices belong to the machine running Python, not the browser. A Chromebook Linux VM can only use devices exposed to that VM. If none are available, CPU mode still works. Float32 devices can give slightly different numerical results. OpenCL accelerates path evolution; random-number generation, statistics, and plotting still run on the CPU, so smaller runs may be faster in NumPy. Full results still need host RAM even though GPU buffers are batched.
 
+## Run in the background (Ubuntu/Debian)
+
+After installing dependencies, activate your virtual environment and run:
+
+```bash
+python start.py
+```
+
+`start.py` launches `app.py` with the same Python interpreter and environment,
+detaches it from the terminal, and returns your prompt. You can then close the
+terminal while the app keeps running. No extra package or `nohup` command is
+required. The launcher resolves paths relative to its own location, so it also
+works when invoked from another directory.
+
+Standard output and errors are appended to `gradio.log` in the repository
+directory. Check this log for Gradio's local/public URLs and startup errors:
+
+```bash
+tail -f gradio.log
+```
+
+Press Ctrl+C to stop following the log; the app continues running. To stop the
+app itself, use the exact command printed by the launcher, for example
+`kill -INT 12345` with your actual PID. This sends the same interrupt as Ctrl+C
+to let Gradio perform its normal shutdown.
+
+Run the launcher once per app instance. Keep `demo.launch()` in its normal
+blocking mode (`prevent_thread_lock=False`, the default). The launcher uses
+the existing app settings, including `share=True`; URLs can take a little time
+to appear. It does not restart the app after a crash or reboot, and cannot keep
+it running while the computer or Linux VM is suspended or shut down.
+
 ## Tests
 Run `python -m unittest discover -s tests -v` after installing the app dependencies. The suite covers device discovery/selection, driver failures, CPU fallback, and the Gradio callbacks. With a usable OpenCL runtime installed, it also executes both float32 and float64 kernels and compares seeded, batched results with NumPy. OpenCL-only checks skip when no compatible device is available.
 
